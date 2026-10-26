@@ -1,7 +1,6 @@
 # keysnip
 
-Keyboard-only screen region capture for Windows, macOS and Linux (X11/XWayland). Select an area without touching the mouse, then copy it to the clipboard and save it as a PNG.
-
+Keyboard-only screen region capture for Windows, macOS and Linux (X11/XWayland). Select an area without touching the mouse, then copy it to the clipboard (optionally saving a PNG too).
 Only Windows has been tested; macOS and Linux support is untested.
 
 ## Install
@@ -12,23 +11,58 @@ Requires Python 3.9+ with tkinter.
 
 ## Settings and autostart
 
-All platforms share one settings file, `keysnip.json`, next to the script (created with defaults on first run; override the path with `KEYSNIP_CONFIG`).
+All platforms share one settings file, `keysnip.json`, next to the script (override the path with `KEYSNIP_CONFIG`). It is created with the defaults on first run and is not committed to git; `keysnip.example.json` in the repo shows every option with its default value, so you can copy it to `keysnip.json` and edit.
 
 ```json
 {
   "autostart": false,
   "save_dir": null,
   "save_to_disk": false,
-  "hotkey_window_seconds": 1.5
+  "hotkey_window_seconds": 1.5,
+  "hotkey": "win+g,s",
+  "keys": {
+    "left": ["Left", "h"],
+    "right": ["Right", "l"],
+    "up": ["Up", "k"],
+    "down": ["Down", "j"],
+    "zoom": ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+    "undo": ["BackSpace"],
+    "reset": ["f"],
+    "capture": ["Return", "space"],
+    "cancel": ["Escape", "q"],
+    "resize_end_modifier": "shift",
+    "resize_start_modifier": "alt",
+    "fine_modifier": "ctrl"
+  }
 }
 ```
+
+You only need to list what you want to change; anything missing keeps its default. Invalid entries are reported on stderr and ignored.
 
 | Setting | Meaning |
 |---|---|
 | `autostart` | `true` launches the hotkey listener at login |
 | `save_dir` | Screenshot folder; `null` = `~/Pictures/keysnip`. The `KEYSNIP_DIR` env var overrides it |
 | `save_to_disk` | `false` (default) = clipboard only, nothing kept (if the clipboard fails, the PNG is saved so the capture isn't lost). `true` = also save every capture as a PNG in `save_dir` |
-| `hotkey_window_seconds` | Max time between G and S |
+| `hotkey_window_seconds` | Max time between the keys of the hotkey sequence |
+| `hotkey` | Global hotkey that opens the overlay (see below) |
+| `keys` | Overlay key bindings (see below) |
+
+### Global hotkey
+
+Format: `<modifiers>+<key>,<key>,...`. Modifiers are `win` (Cmd on macOS), `ctrl`, `alt` and `shift`, joined with `+`. Keys are single letters or digits, pressed in order within `hotkey_window_seconds`.
+
+| Example | Meaning |
+|---|---|
+| `win+g,s` | Hold Win, press G, then S (default) |
+| `ctrl+alt+x` | A single chord |
+| `g,s` | No modifier: press G then S anywhere (will also fire while typing "gs") |
+
+On Windows, when the hotkey uses `win`, those Win+key combinations are swallowed so the built-in shortcut doesn't fire.
+
+### Overlay keys
+
+Each action takes a list of keys. Use a single character (`"h"`, case-insensitive) or a tkinter key name (`"Left"`, `"Return"`, `"BackSpace"`, `"space"`, `"Escape"`, `"Tab"`, `"F5"`, ...). Setting an action replaces its default list, so include every key you want. `zoom` needs exactly 9 keys, in numpad order (1 = bottom-left ... 9 = top-right); they are also the labels drawn on the grid. The three `*_modifier` settings accept `shift`, `ctrl`, `alt` or `none`.
 
 Starting the listener syncs the OS autostart entry with `autostart`. To apply a change without starting the listener, run `python keysnip.py --apply-config`. `python keysnip.py --status` shows the config path and whether autostart is registered.
 
@@ -45,13 +79,14 @@ On macOS, the interpreter launched at login needs the Accessibility/Input Monito
     python keysnip.py          # start the background listener
     python keysnip.py --now    # open the overlay immediately, capture once, exit
 
-With the listener running, press **Win+G, then S** (Cmd+G, then S on macOS) within 1.5 s to open the overlay. Stop the listener with Ctrl+C in its terminal.
+With the listener running, press the configured hotkey (default **Win+G, then S**; Cmd+G, then S on macOS) within 1.5 s to open the overlay. Stop the listener with Ctrl+C in its terminal.
 
-- On Windows, Win+G (Game Bar) and Win+S (Search) are swallowed while the listener runs.
+- On Windows, with the default hotkey, Win+G (Game Bar) and Win+S (Search) are swallowed while the listener runs.
 - When started with `pythonw.exe` (as autostart does), stop it from Task Manager or with `Stop-Process -Id <PID>`.
 
 ## Overlay keys
 
+Defaults (all configurable under `keys`):
 | Keys | Action |
 |---|---|
 | 1-9 | Zoom the selection into that cell of a 3x3 grid (numpad layout: 7 8 9 on top). Repeat to narrow quickly |
@@ -70,19 +105,20 @@ A right-click also cancels. The label above the selection shows its size and pos
 
 ## Output and configuration
 
-- The capture is copied to the clipboard: PowerShell on Windows, `osascript` on macOS, `wl-copy` or `xclip` on Linux. With `save_to_disk` on, it is also saved as `keysnip_YYYYMMDD_HHMMSS.png` in `save_dir`. If no clipboard tool is available, the PNG is saved regardless.
+- The capture is copied to the clipboard: the Win32 clipboard API directly on Windows (no helper process, so no console window flashes), `osascript` on macOS, `wl-copy` or `xclip` on Linux. With `save_to_disk` on, it is also saved as `keysnip_YYYYMMDD_HHMMSS.png` in `save_dir`. If the clipboard can't be used, the PNG is saved regardless.
 - Exit code: `0` on capture, `1` on cancel (with `--now`).
 
 ## How it works
 
-1. The hotkey listener (`pynput`) runs in the main loop and waits for the Win/Cmd+G, S sequence.
+1. The hotkey listener (`pynput`) runs in the main loop and waits for the configured hotkey. It keeps one hidden Tk window alive so each capture opens quickly.
 2. On trigger, it grabs the whole primary screen with Pillow.
 3. A fullscreen tkinter overlay shows the dimmed screenshot with the selection highlighted. On Windows it is a borderless popup, so tiling window managers such as wtile ignore it.
-4. On Enter, the selected region is cropped from the original grab, saved and copied.
+4. On Enter, the selected region is cropped from the original grab and copied (and saved if `save_to_disk` is on).
 
 ## Platform notes
 
-- **Windows:** the overlay forces itself to the foreground so it receives keystrokes. Mouse clicking it also grabs focus.
+- **Windows:** the overlay takes the foreground with `SetForegroundWindow` (attaching to the current foreground thread's input to get past the foreground lock) and takes it back if something steals it. It never synthesizes Alt key presses, because those put a window into menu mode and swallow keys. It waits for Win/Shift/Ctrl/Alt to be released before appearing, so a still-held modifier can't turn its keys into system shortcuts. Pressing the hotkey while the overlay is open is ignored. The listener detects when the session is unlocked and recreates its keyboard hook, so the hotkey keeps working after the lock screen. It also recreates the hook if it ever stops.
+- **Single instance:** only one listener runs at a time (an OS file lock in the temp folder). A second `python keysnip.py` prints "keysnip is already running" and exits with code 2, which also makes autostart harmless if you start it manually too. The lock is released automatically if the process exits or crashes. `--now`, `--status` and `--apply-config` are not affected.
 - **macOS:** grant the terminal Screen Recording (for capture) and Accessibility/Input Monitoring (for the hotkey).
 - **Linux:** needs an X11 or XWayland session (`DISPLAY` set). Pure Wayland is not supported. The clipboard step needs `xclip` or `wl-copy`.
 
@@ -94,6 +130,8 @@ A right-click also cancels. The label above the selection shows its size and pos
 
 ## Troubleshooting
 
-- **Overlay doesn't accept keys:** click it once, or restart the listener.
-- **Nothing happens on the hotkey:** check the listener is running, and that G and S are pressed within 1.5 s while holding Win.
-- **Clipboard unavailable message:** the PNG is still saved; install `xclip` or `wl-copy` on Linux.
+- **Overlay doesn't accept keys:** click it once to take focus, or restart the listener.
+- **Nothing happens on the hotkey:** check the listener is running, and that the keys are pressed in order within `hotkey_window_seconds` while holding the modifiers. After a lock/unlock the hook restarts itself within about a second.
+- **"keysnip is already running":** another listener holds the lock. On Windows, find it with `Get-CimInstance Win32_Process | Where-Object CommandLine -match keysnip` and stop it with `Stop-Process -Id <PID>`; it usually runs as `pythonw.exe` (autostart).
+- **Config change has no effect:** restart the listener; settings are read at startup. Warnings about invalid entries are printed to stderr (not visible under `pythonw`; run `python keysnip.py` in a terminal to see them).
+- **Clipboard unavailable message:** the PNG is saved instead so the capture isn't lost; install `xclip` or `wl-copy` on Linux.

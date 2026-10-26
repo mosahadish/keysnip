@@ -1,0 +1,21 @@
+{
+  "autostart": false,
+  "save_dir": null,
+  "save_to_disk": false,
+  "hotkey_window_seconds": 1.5,
+  "hotkey": "win+g,s",
+  "keys": {
+    "left": ["Left", "h"],
+    "right": ["Right", "l"],
+    "up": ["Up", "k"],
+    "down": ["Down", "j"],
+    "zoom": ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+    "undo": ["BackSpace"],
+    "reset": ["f"],
+    "capture": ["Return", "space"],
+    "cancel": ["Escape", "q"],
+    "resize_end_modifier": "shift",
+    "resize_start_modifier": "alt",
+    "fine_modifier": "ctrl"
+  }
+}

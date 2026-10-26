@@ -1,12 +1,12 @@
 """keysnip - keyboard-only screen region capture (Windows / macOS / Linux).
 
 Usage:
-  python keysnip.py         listen for Win/Cmd+G then S, then open the overlay
+  python keysnip.py         listen for the configured hotkey (default Win/Cmd+G then S); one instance only
   python keysnip.py --now   open the overlay immediately
   python keysnip.py --apply-config   sync the OS autostart entry with keysnip.json
   python keysnip.py --status         show config path and autostart state
 
-Overlay keys:
+Overlay keys (defaults; all configurable under "keys" in keysnip.json):
   1-9               zoom into that cell of a 3x3 grid (numpad layout)
   Backspace         undo last step
   Arrows / h j k l  move the selection (accelerates while held)
@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -33,6 +34,7 @@ import settings
 
 SYSTEM = platform.system()
 CONFIG = settings.load()
+KEYS = CONFIG["keys"]
 SAVE_DIR = Path(os.environ.get("KEYSNIP_DIR") or CONFIG["save_dir"] or Path.home() / "Pictures" / "keysnip").expanduser()
 STEP, FINE = 10, 1
 
@@ -52,13 +54,54 @@ def grab_screen():
     return ImageGrab.grab()
 
 
+def copy_image_windows(path):
+    """Put the image on the Windows clipboard as a DIB using the Win32 API directly (no subprocess, so no
+    console window flashes when running under pythonw, and it is much faster than shelling out)."""
+    import ctypes
+    import io
+    from ctypes import wintypes
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.open(path).convert("RGB").save(buf, "BMP")
+    data = buf.getvalue()[14:]  # drop the 14-byte BITMAPFILEHEADER; the rest is a DIB
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+
+    handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+    if not handle:
+        return False
+    ctypes.memmove(kernel32.GlobalLock(handle), data, len(data))
+    kernel32.GlobalUnlock(handle)
+    for _ in range(20):  # another app may hold the clipboard for a moment
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        kernel32.GlobalFree(handle)
+        return False
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(8, handle):  # CF_DIB; on success the clipboard owns the memory
+            kernel32.GlobalFree(handle)
+            return False
+    finally:
+        user32.CloseClipboard()
+    return True
+
+
 def copy_to_clipboard(path):
     try:
         if SYSTEM == "Windows":
-            ps = ("Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
-                  f"[Windows.Forms.Clipboard]::SetImage([Drawing.Image]::FromFile('{path}'))")
-            subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
-                           check=True, capture_output=True)
+            return copy_image_windows(path)
         elif SYSTEM == "Darwin":
             script = f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)'
             subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
@@ -75,8 +118,33 @@ def copy_to_clipboard(path):
         return False
 
 
+def force_foreground(hwnd):
+    """Windows: make hwnd the foreground window without synthesizing keys (an Alt tap would put the window
+    into menu mode and swallow keys). Attaching to the current foreground thread's input lifts the lock."""
+    import ctypes
+    from ctypes import wintypes
+    u, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    u.GetForegroundWindow.restype = wintypes.HWND
+    u.SetForegroundWindow.argtypes = [wintypes.HWND]
+    u.BringWindowToTop.argtypes = [wintypes.HWND]
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u.GetWindowThreadProcessId.restype = wintypes.DWORD
+    u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    k32.GetCurrentThreadId.restype = wintypes.DWORD
+    fg = u.GetForegroundWindow()
+    fg_tid = u.GetWindowThreadProcessId(fg, None) if fg else 0
+    me = k32.GetCurrentThreadId()
+    attached = bool(fg_tid and fg_tid != me and u.AttachThreadInput(me, fg_tid, True))
+    try:
+        u.BringWindowToTop(hwnd)
+        u.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            u.AttachThreadInput(me, fg_tid, False)
+
+
 class Selector:
-    def __init__(self, shot):
+    def __init__(self, shot, master=None):
         self.shot = shot
         self.w, self.h = shot.size
         self.dim = ImageEnhance.Brightness(shot).enhance(0.4)
@@ -84,7 +152,8 @@ class Selector:
         self.history, self.streak, self.last_move = [], 0, 0.0
         self.result = None
 
-        self.root = tk.Tk()
+        self.master = master
+        self.root = tk.Toplevel(master) if master else tk.Tk()
         self.root.geometry(f"{self.w}x{self.h}+0+0")
         if SYSTEM == "Windows":
             # Borderless popup (no caption/frame, no taskbar entry) so tiling managers ignore it
@@ -99,20 +168,36 @@ class Selector:
         self.canvas.create_image(0, 0, image=self.dim_tk, anchor="nw")
         self.root.bind("<Key>", self.on_key)
         self.root.bind("<Button-3>", lambda e: self.root.destroy())
-        self.root.bind("<FocusOut>", lambda e: self.root.after(200, self.root.focus_force))
         self.root.bind("<Button-1>", lambda e: self.take_focus())
-        self.root.after(50, self.take_focus)
         self.draw()
+        self.root.update_idletasks()
+        self.take_focus()
+        self.root.after(150, self.keep_focus)
+
+    def hwnd(self):
+        import ctypes
+        return ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+
+    def keep_focus(self):
+        """Reclaim the foreground if something (Start menu, a stray Win key, ...) took it from the overlay."""
+        try:
+            if SYSTEM == "Windows":
+                import ctypes
+                if ctypes.windll.user32.GetForegroundWindow() != self.hwnd():
+                    self.take_focus()
+            self.root.after(150, self.keep_focus)
+        except tk.TclError:  # overlay already closed
+            pass
 
     def take_focus(self):
-        if SYSTEM == "Windows":
-            import ctypes
-            u = ctypes.windll.user32
-            u.keybd_event(0x12, 0, 0, 0)  # Alt tap lets us bypass the foreground lock
-            u.keybd_event(0x12, 0, 2, 0)
-        self.root.lift()
-        self.root.focus_force()
-        self.canvas.focus_set()
+        try:
+            if SYSTEM == "Windows":
+                force_foreground(self.hwnd())
+            self.root.lift()
+            self.root.focus_force()
+            self.canvas.focus_set()
+        except tk.TclError:  # overlay already closed
+            pass
 
     def draw(self):
         self.canvas.delete("sel")
@@ -131,7 +216,7 @@ class Selector:
             for n in range(9):
                 cx = self.x1 + (n % 3 + 0.5) * cw
                 cy = self.y1 + (2 - n // 3 + 0.5) * ch
-                self.canvas.create_text(cx, cy, text=str(n + 1), fill="#00aaff",
+                self.canvas.create_text(cx, cy, text=KEYS["zoom"][n], fill="#00aaff",
                                         font=("Segoe UI", 20, "bold"), tags="sel")
         label = f"{self.x2 - self.x1} x {self.y2 - self.y1}  @ {self.x1},{self.y1}"
         ty = self.y1 - 22 if self.y1 > 30 else self.y2 + 6
@@ -154,33 +239,49 @@ class Selector:
         self.y1 = min(max(0, self.y1 + dy), self.h - h)
         self.x2, self.y2 = self.x1 + w, self.y1 + h
 
+    @staticmethod
+    def key_matches(configured, keysym):
+        return keysym == configured or (len(configured) == 1 and keysym.lower() == configured.lower())
+
+    def matches(self, action, keysym):
+        return any(self.key_matches(k, keysym) for k in KEYS[action])
+
+    def zoom_index(self, keysym):
+        return next((i for i, k in enumerate(KEYS["zoom"]) if self.key_matches(k, keysym)), None)
+
+    def modifier_down(self, name, state):
+        alt_mask = 0x20000 if SYSTEM == "Windows" else 0x8
+        mask = {"shift": 0x1, "ctrl": 0x4, "alt": alt_mask}.get(name)
+        return bool(mask and state & mask)
+
     def on_key(self, e):
         keysym = e.keysym
-        ctrl, shift = bool(e.state & 0x4), bool(e.state & 0x1)
-        alt = bool(e.state & 0x20000) if SYSTEM == "Windows" else bool(e.state & 0x8)
-        dirs = {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1),
-                "h": (-1, 0), "l": (1, 0), "k": (0, -1), "j": (0, 1)}
-        if keysym in dirs or keysym.lower() in dirs and not keysym.isupper():
-            d = dirs.get(keysym) or dirs[keysym.lower()]
+        direction = next(((dx, dy) for name, (dx, dy) in
+                          (("left", (-1, 0)), ("right", (1, 0)), ("up", (0, -1)), ("down", (0, 1)))
+                          if self.matches(name, keysym)), None)
+        if direction:
+            fine = self.modifier_down(KEYS["fine_modifier"], e.state)
+            resize_end = self.modifier_down(KEYS["resize_end_modifier"], e.state)
+            resize_start = self.modifier_down(KEYS["resize_start_modifier"], e.state)
             now = time.time()
             self.streak = self.streak + 1 if now - self.last_move < 0.15 else 0
             self.last_move = now
-            step = FINE if ctrl else STEP * min(1 + self.streak // 4, 10)
-            dx, dy = d[0] * step, d[1] * step
+            step = FINE if fine else STEP * min(1 + self.streak // 4, 10)
+            dx, dy = direction[0] * step, direction[1] * step
             self.push()
-            if shift:
+            if resize_end:
                 self.x2 += dx
                 self.y2 += dy
-            elif alt:
+            elif resize_start:
                 self.x1 += dx
                 self.y1 += dy
             else:
                 self.move(dx, dy)
             self.clamp()
             self.draw()
-        elif keysym in "123456789" and len(keysym) == 1:
-            n = int(keysym) - 1
-            col, row = n % 3, 2 - n // 3  # numpad layout: 7 8 9 on top
+        elif self.zoom_index(keysym) is not None:
+            n = self.zoom_index(keysym)
+            col, row = n % 3, 2 - n // 3  # numpad layout: cell 7 8 9 on top
             cw, ch = (self.x2 - self.x1) / 3, (self.y2 - self.y1) / 3
             self.push()
             x1, y1 = self.x1, self.y1
@@ -188,17 +289,18 @@ class Selector:
             self.y1, self.y2 = round(y1 + row * ch), round(y1 + (row + 1) * ch)
             self.clamp()
             self.draw()
-        elif keysym == "BackSpace" and self.history:
-            self.x1, self.y1, self.x2, self.y2 = self.history.pop()
-            self.draw()
-        elif keysym.lower() == "f":
+        elif self.matches("undo", keysym):
+            if self.history:
+                self.x1, self.y1, self.x2, self.y2 = self.history.pop()
+                self.draw()
+        elif self.matches("reset", keysym):
             self.push()
             self.x1, self.y1, self.x2, self.y2 = 0, 0, self.w, self.h
             self.draw()
-        elif keysym in ("Return", "space"):
+        elif self.matches("capture", keysym):
             self.result = (self.x1, self.y1, self.x2, self.y2)
             self.root.destroy()
-        elif keysym == "Escape" or keysym.lower() == "q":
+        elif self.matches("cancel", keysym):
             self.root.destroy()
 
     def push(self):
@@ -206,14 +308,54 @@ class Selector:
         del self.history[:-50]
 
     def run(self):
-        self.root.mainloop()
+        if self.master:
+            self.root.wait_window()
+        else:
+            self.root.mainloop()
         return self.result
 
 
+def session_locked():
+    """True while the Windows lock screen (secure desktop) is the input desktop."""
+    if SYSTEM != "Windows":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    desktop = user32.OpenInputDesktop(0, False, 0x0100)  # DESKTOP_SWITCHDESKTOP
+    if not desktop:
+        return True
+    user32.CloseDesktop(desktop)
+    return False
+
+
+def wait_modifiers_released(timeout=1.5):
+    """Windows: hold off until Win/Shift/Ctrl/Alt are physically up, so the overlay's keys and our focus
+    taps don't combine with a still-held modifier into system shortcuts (Win+<digit>, Win+Alt, ...)."""
+    if SYSTEM != "Windows":
+        return
+    import ctypes
+    down = ctypes.windll.user32.GetAsyncKeyState
+    deadline = time.time() + timeout
+    while time.time() < deadline and any(down(vk) & 0x8000 for vk in (0x5B, 0x5C, 0x10, 0x11, 0x12)):
+        time.sleep(0.01)
+
+
+OVERLAY_OPEN = threading.Event()  # set while an overlay is showing; the hotkey is ignored meanwhile
+MASTER = None  # hidden Tk root kept alive by the listener so each capture skips Tk startup
+
+
 def capture_once():
-    time.sleep(0.15)
-    shot = grab_screen().convert("RGB")
-    box = Selector(shot).run()
+    OVERLAY_OPEN.set()
+    try:
+        shot = grab_screen().convert("RGB")
+        wait_modifiers_released()
+        box = Selector(shot, MASTER).run()
+    finally:
+        OVERLAY_OPEN.clear()
     if not box:
         print("cancelled")
         return 1
@@ -241,68 +383,133 @@ def capture_once():
 
 
 def listen(window=1.5):
-    """Wait in the background; pressing Win/Cmd+G then S starts a capture."""
+    """Wait in the background; the configured hotkey (default Win/Cmd+G then S) starts a capture."""
     import queue
     from pynput import keyboard
 
+    modifiers, sequence = settings.parse_hotkey(CONFIG["hotkey"])
+    groups = {
+        "meta": {keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r},
+        "ctrl": {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r},
+        "alt": {keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr},
+        "shift": {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r},
+    }
+    modifier_keys = set().union(*(groups[m] for m in modifiers)) if modifiers else set()
+
     triggers = queue.Queue()
-    state = {"got_g": False, "last": 0.0}
+    state = {"pos": 0, "last": 0.0}
     held = set()
-    meta = {keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r}
+
+    def modifiers_held():
+        return all(held & groups[m] for m in modifiers)
 
     def on_press(key):
-        if key in meta:
+        if key in modifier_keys:
             held.add(key)
             return
+        if OVERLAY_OPEN.is_set():  # ignore the hotkey (and reset the sequence) while the overlay is up
+            state["pos"] = 0
+            return
+        if not modifiers_held():
+            return
         ch = (getattr(key, "char", None) or "").lower()
-        if not held or ch not in ("g", "s"):
+        if not ch.isalnum():  # e.g. Ctrl+G reports a control character; fall back to the virtual-key code
+            vk = getattr(key, "vk", None)
+            ch = chr(vk).lower() if vk and (0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A) else ""
+        if not ch:  # non-character keys (including our own dummy key) must not break a sequence
             return
         now = time.time()
         if now - state["last"] > window:
-            state["got_g"] = False
+            state["pos"] = 0
         state["last"] = now
-        if ch == "g":
-            state["got_g"] = True
-        elif state["got_g"]:
-            state["got_g"] = False
-            triggers.put(1)
+        if ch == sequence[state["pos"]]:
+            state["pos"] += 1
+            if state["pos"] == len(sequence):
+                state["pos"] = 0
+                triggers.put(1)
+        else:
+            state["pos"] = 1 if ch == sequence[0] else 0
 
     def on_release(key):
         held.discard(key)
 
     kwargs = {}
-    if SYSTEM == "Windows":
+    current = {"listener": None}
+    if SYSTEM == "Windows" and "meta" in modifiers:
         import ctypes
 
+        vks = {ord(k.upper()) for k in sequence}
+
         def win_filter(msg, data):
-            # Swallow Win+G / Win+S (Game Bar / Search); a dummy key stops the Start menu opening on Win release.
+            # Swallow Win+<key> so Windows shortcuts (Game Bar, Search, ...) don't fire; a dummy key stops
+            # the Start menu opening on Win release.
             user32 = ctypes.windll.user32
             win_down = (user32.GetAsyncKeyState(0x5B) & 0x8000) or (user32.GetAsyncKeyState(0x5C) & 0x8000)
-            if data.vkCode in (0x47, 0x53) and win_down and msg in (0x100, 0x101):
+            if data.vkCode in vks and win_down and msg in (0x100, 0x101):
                 if msg == 0x100:
                     user32.keybd_event(0xFF, 0, 0, 0)
                     user32.keybd_event(0xFF, 0, 2, 0)
                     on_press(keyboard.KeyCode.from_char(chr(data.vkCode).lower()))
-                listener.suppress_event()
+                current["listener"].suppress_event()
             return True
 
         kwargs["win32_event_filter"] = win_filter
 
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release, **kwargs)
-    listener.start()
-    print("keysnip listening: press Win+G then S to capture (Ctrl+C here to quit)")
+    def start_listener():
+        held.clear()
+        state.update(pos=0, last=0.0)
+        current["listener"] = keyboard.Listener(on_press=on_press, on_release=on_release, **kwargs)
+        current["listener"].start()
+
+    start_listener()
+    global MASTER
+    MASTER = tk.Tk()
+    MASTER.withdraw()
+    print(f"keysnip listening: press {CONFIG['hotkey']} to capture (Ctrl+C here to quit)")
+    was_locked = False
     try:
         while True:
             try:
                 triggers.get(timeout=0.5)
             except queue.Empty:
+                # Hooks can go stale across a lock/unlock (or die), so recreate them after unlocking
+                locked = session_locked()
+                if (was_locked and not locked) or not current["listener"].is_alive():
+                    current["listener"].stop()
+                    start_listener()
+                    print("keysnip: keyboard hook restarted", flush=True)
+                was_locked = locked
                 continue
             capture_once()
             while not triggers.empty():
                 triggers.get_nowait()
     except KeyboardInterrupt:
-        listener.stop()
+        current["listener"].stop()
     return 0
+
+
+_LOCK_HANDLE = None  # kept open for the life of the process to hold the single-instance lock
+
+
+def acquire_single_instance():
+    """Take an OS-level exclusive lock; returns False if another keysnip listener already holds it.
+    The OS releases the lock if the process exits or crashes, so it can't go stale."""
+    global _LOCK_HANDLE
+    import getpass
+    path = Path(tempfile.gettempdir()) / f"keysnip-{getpass.getuser()}.lock"
+    handle = open(path, "a+b")
+    try:
+        if SYSTEM == "Windows":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    _LOCK_HANDLE = handle
+    return True
 
 
 def main():
@@ -316,6 +523,9 @@ def main():
     enable_dpi_awareness()
     if "--now" in sys.argv:
         return capture_once()
+    if not acquire_single_instance():
+        print("keysnip is already running; exiting.")
+        return 2
     print(settings.apply(CONFIG))
     return listen(window=float(CONFIG["hotkey_window_seconds"]))
 

@@ -18,19 +18,78 @@ DEFAULTS = {
     "autostart": False,       # launch the hotkey listener at login (Windows, macOS, Linux)
     "save_dir": None,         # None = ~/Pictures/keysnip (KEYSNIP_DIR env var still wins)
     "save_to_disk": False,    # True = also keep a PNG in save_dir; False = clipboard only
-    "hotkey_window_seconds": 1.5,  # max time between G and S
+    "hotkey_window_seconds": 1.5,  # max time between keys of the hotkey sequence
+    # Global hotkey that opens the overlay: "<modifier>+<key>,<key>,..." (win/cmd, ctrl, alt, shift or none)
+    "hotkey": "win+g,s",
+    # Overlay keys: tkinter keysym names (e.g. Left, Return, BackSpace, space, Escape) or single characters
+    "keys": {
+        "left": ["Left", "h"],
+        "right": ["Right", "l"],
+        "up": ["Up", "k"],
+        "down": ["Down", "j"],
+        "zoom": ["1", "2", "3", "4", "5", "6", "7", "8", "9"],  # cells in numpad order: 1 bottom-left ... 9 top-right
+        "undo": ["BackSpace"],
+        "reset": ["f"],
+        "capture": ["Return", "space"],
+        "cancel": ["Escape", "q"],
+        "resize_end_modifier": "shift",    # + direction moves the bottom-right corner
+        "resize_start_modifier": "alt",    # + direction moves the top-left corner
+        "fine_modifier": "ctrl",           # + direction moves 1 px instead of 10
+    },
 }
+
+MODIFIER_NAMES = {"none", "shift", "ctrl", "alt"}
+HOTKEY_MODIFIERS = {"win": "meta", "cmd": "meta", "super": "meta", "meta": "meta",
+                    "ctrl": "ctrl", "alt": "alt", "shift": "shift", "none": None}
+
+
+def parse_hotkey(text):
+    """'win+g,s' -> (['meta'], ['g', 's']); 'ctrl+alt+x' -> (['ctrl', 'alt'], ['x']); 'g,s' -> ([], ['g', 's'])."""
+    *mod_parts, keys_part = text.split("+")
+    modifiers = [HOTKEY_MODIFIERS.get(m.strip().lower(), "invalid") for m in mod_parts]
+    modifiers = [m for m in modifiers if m is not None]  # "none" maps to None: no modifier
+    keys = [k.strip().lower() for k in keys_part.split(",") if k.strip()]
+    if "invalid" in modifiers or not keys or any(len(k) != 1 or not k.isalnum() for k in keys):
+        raise ValueError(f"invalid hotkey {text!r}; expected e.g. 'win+g,s' or 'ctrl+alt+x' (single letters/digits)")
+    return modifiers, keys
+
+
+def _clean_keys(user_keys):
+    keys = {k: (list(v) if isinstance(v, list) else v) for k, v in DEFAULTS["keys"].items()}
+    for name, value in (user_keys or {}).items():
+        if name not in keys:
+            print(f"keysnip: unknown key action {name!r} in config, ignored", file=sys.stderr)
+        elif name.endswith("_modifier"):
+            if isinstance(value, str) and value.lower() in MODIFIER_NAMES:
+                keys[name] = value.lower()
+            else:
+                print(f"keysnip: {name} must be one of {sorted(MODIFIER_NAMES)}, using default", file=sys.stderr)
+        elif isinstance(value, list) and value and all(isinstance(x, str) and x for x in value) \
+                and (name != "zoom" or len(value) == 9):
+            keys[name] = value
+        else:
+            print(f"keysnip: {name} must be a non-empty list of key names"
+                  f"{' (9 for zoom)' if name == 'zoom' else ''}, using default", file=sys.stderr)
+    return keys
 
 
 def load():
-    cfg = dict(DEFAULTS)
+    cfg = json.loads(json.dumps(DEFAULTS))
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(json.dumps(DEFAULTS, indent=2) + "\n", encoding="utf-8")
         return cfg
     try:
-        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        user_keys = user.pop("keys", None)
+        cfg.update(user)
+        cfg["keys"] = _clean_keys(user_keys)
     except (OSError, ValueError) as exc:
         print(f"keysnip: ignoring unreadable config {CONFIG_PATH}: {exc}", file=sys.stderr)
+    try:
+        parse_hotkey(cfg["hotkey"])
+    except (ValueError, AttributeError) as exc:
+        print(f"keysnip: {exc}; using default", file=sys.stderr)
+        cfg["hotkey"] = DEFAULTS["hotkey"]
     return cfg
 
 
