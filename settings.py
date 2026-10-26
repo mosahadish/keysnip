@@ -104,7 +104,7 @@ def _launcher():
 
 
 def _win_command():
-    return f'"{_launcher()}" "{SCRIPT}"'
+    return f'"{_launcher()}" "{SCRIPT}" --foreground'
 
 
 _WIN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -136,7 +136,7 @@ def enable():
         with open(_MAC_PLIST, "wb") as f:
             plistlib.dump({
                 "Label": "com.keysnip.listener",
-                "ProgramArguments": [_launcher(), str(SCRIPT)],
+                "ProgramArguments": [_launcher(), str(SCRIPT), "--foreground"],
                 "RunAtLoad": True,
                 "KeepAlive": False,
             }, f)
@@ -144,7 +144,7 @@ def enable():
         _LINUX_DESKTOP.parent.mkdir(parents=True, exist_ok=True)
         _LINUX_DESKTOP.write_text(
             "[Desktop Entry]\nType=Application\nName=keysnip\n"
-            f'Exec="{_launcher()}" "{SCRIPT}"\nX-GNOME-Autostart-enabled=true\n',
+            f'Exec="{_launcher()}" "{SCRIPT}" --foreground\nX-GNOME-Autostart-enabled=true\n',
             encoding="utf-8")
 
 
@@ -161,9 +161,13 @@ def disable():
 
 
 def apply(cfg):
-    """Make the OS autostart entry match cfg['autostart']; returns a status message."""
+    """Make the OS autostart entry match cfg['autostart']; returns a status message.
+    When enabled, the entry is rewritten so it always points at the current script and flags."""
     want = bool(cfg.get("autostart"))
-    if want == is_enabled():
-        return f"autostart already {'enabled' if want else 'disabled'}"
-    enable() if want else disable()
-    return f"autostart {'enabled' if want else 'disabled'}"
+    if want:
+        enable()
+        return "autostart enabled"
+    if is_enabled():
+        disable()
+        return "autostart disabled"
+    return "autostart already disabled"

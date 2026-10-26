@@ -64,7 +64,7 @@ On Windows, when the hotkey uses `win`, those Win+key combinations are swallowed
 
 Each action takes a list of keys. Use a single character (`"h"`, case-insensitive) or a tkinter key name (`"Left"`, `"Return"`, `"BackSpace"`, `"space"`, `"Escape"`, `"Tab"`, `"F5"`, ...). Setting an action replaces its default list, so include every key you want. `zoom` needs exactly 9 keys, in numpad order (1 = bottom-left ... 9 = top-right); they are also the labels drawn on the grid. The three `*_modifier` settings accept `shift`, `ctrl`, `alt` or `none`.
 
-Starting the listener syncs the OS autostart entry with `autostart`. To apply a change without starting the listener, run `python keysnip.py --apply-config`. `python keysnip.py --status` shows the config path and whether autostart is registered.
+Starting the listener syncs the OS autostart entry with `autostart` (the entry runs `keysnip.py --foreground`, since the OS already supervises it). To apply a change without starting the listener, run `python keysnip.py --apply-config`. `python keysnip.py --status` shows the config path, whether autostart is registered and whether the listener is running.
 
 | OS | Autostart mechanism |
 |---|---|
@@ -76,13 +76,19 @@ On macOS, the interpreter launched at login needs the Accessibility/Input Monito
 
 ## Usage
 
-    python keysnip.py          # start the background listener
-    python keysnip.py --now    # open the overlay immediately, capture once, exit
+One file, the same command on every platform:
 
-With the listener running, press the configured hotkey (default **Win+G, then S**; Cmd+G, then S on macOS) within 1.5 s to open the overlay. Stop the listener with Ctrl+C in its terminal.
+    python keysnip.py              # start the listener in the background and return (no console stays open)
+    python keysnip.py --foreground # run the listener in this terminal instead (Ctrl+C quits, errors are visible)
+    python keysnip.py --now        # open the overlay immediately, capture once, exit
+    python keysnip.py --status     # config path, autostart state, whether the listener is running
+
+The first form starts a detached copy of itself (`pythonw.exe` on Windows, a new session on macOS/Linux) and exits, so there is no terminal to keep open and it keeps running if you close the one you started it from. On Windows, `pythonw keysnip.py` avoids even the brief console flash of `python`. Launching it twice is harmless: a second copy sees the first and exits.
+
+With the listener running, press the configured hotkey (default **Win+G, then S**; Cmd+G, then S on macOS) within 1.5 s to open the overlay.
 
 - On Windows, with the default hotkey, Win+G (Game Bar) and Win+S (Search) are swallowed while the listener runs.
-- When started with `pythonw.exe` (as autostart does), stop it from Task Manager or with `Stop-Process -Id <PID>`.
+- **Stopping it:** Windows `Get-CimInstance Win32_Process | Where-Object CommandLine -match keysnip` to find the PID, then `Stop-Process -Id <PID>`; macOS/Linux `pkill -f keysnip.py`.
 
 ## Overlay keys
 
@@ -132,6 +138,7 @@ A right-click also cancels. The label above the selection shows its size and pos
 
 - **Overlay doesn't accept keys:** click it once to take focus, or restart the listener.
 - **Nothing happens on the hotkey:** check the listener is running, and that the keys are pressed in order within `hotkey_window_seconds` while holding the modifiers. After a lock/unlock the hook restarts itself within about a second.
-- **"keysnip is already running":** another listener holds the lock. On Windows, find it with `Get-CimInstance Win32_Process | Where-Object CommandLine -match keysnip` and stop it with `Stop-Process -Id <PID>`; it usually runs as `pythonw.exe` (autostart).
-- **Config change has no effect:** restart the listener; settings are read at startup. Warnings about invalid entries are printed to stderr (not visible under `pythonw`; run `python keysnip.py` in a terminal to see them).
+- **"keysnip is already running":** another listener holds the lock. Stop it first (see Usage), or just use it. `python keysnip.py --status` confirms it is running.
+- **Config change has no effect:** restart the listener; settings are read at startup. Warnings about invalid entries are printed to stderr, which the background copy discards; run `python keysnip.py --foreground` in a terminal to see them.
+- **Listener starts and nothing happens, no error:** the background copy hides startup errors. Run `python keysnip.py --foreground` to see them.
 - **Clipboard unavailable message:** the PNG is saved instead so the capture isn't lost; install `xclip` or `wl-copy` on Linux.

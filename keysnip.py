@@ -1,10 +1,11 @@
 """keysnip - keyboard-only screen region capture (Windows / macOS / Linux).
 
 Usage:
-  python keysnip.py         listen for the configured hotkey (default Win/Cmd+G then S); one instance only
-  python keysnip.py --now   open the overlay immediately
+  python keysnip.py                  start the listener in the background (no terminal or console stays open)
+  python keysnip.py --foreground     run the listener in this terminal (Ctrl+C quits); default hotkey Win/Cmd+G then S
+  python keysnip.py --now            open the overlay immediately
   python keysnip.py --apply-config   sync the OS autostart entry with keysnip.json
-  python keysnip.py --status         show config path and autostart state
+  python keysnip.py --status         show config path, autostart state and whether the listener is running
 
 Overlay keys (defaults; all configurable under "keys" in keysnip.json):
   1-9               zoom into that cell of a 3x3 grid (numpad layout)
@@ -512,17 +513,51 @@ def acquire_single_instance():
     return True
 
 
+def already_running():
+    """Peek at the single-instance lock without keeping it."""
+    global _LOCK_HANDLE
+    if not acquire_single_instance():
+        return True
+    _LOCK_HANDLE.close()
+    _LOCK_HANDLE = None
+    return False
+
+
+def spawn_background():
+    """Re-launch this script as a detached listener with no console or terminal, then let the caller exit."""
+    args = [sys.executable, str(Path(__file__).resolve()), "--foreground"]
+    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    if SYSTEM == "Windows":
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        if pythonw.exists():
+            args[0] = str(pythonw)
+        # DETACHED_PROCESS | CREATE_NO_WINDOW: no console, and it survives the launching terminal closing
+        subprocess.Popen(args, creationflags=0x00000008 | 0x08000000, **quiet)
+    else:
+        subprocess.Popen(args, start_new_session=True, **quiet)
+
+
 def main():
     if "--apply-config" in sys.argv:
         print(settings.apply(CONFIG))
         return 0
     if "--status" in sys.argv:
         print(f"config: {settings.CONFIG_PATH}\nautostart configured: {CONFIG['autostart']}, "
-              f"registered with OS: {settings.is_enabled()}")
+              f"registered with OS: {settings.is_enabled()}\nlistener running: {already_running()}")
         return 0
     enable_dpi_awareness()
     if "--now" in sys.argv:
         return capture_once()
+    # pythonw (and --foreground) is already detached; anything else hands off to a background copy
+    foreground = "--foreground" in sys.argv or Path(sys.executable).name.lower() == "pythonw.exe"
+    if not foreground:
+        if already_running():
+            print("keysnip is already running.")
+            return 2
+        spawn_background()
+        print("keysnip started in the background. Use `python keysnip.py --foreground` to run it in this "
+              "terminal instead.")
+        return 0
     if not acquire_single_instance():
         print("keysnip is already running; exiting.")
         return 2
