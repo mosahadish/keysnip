@@ -6,6 +6,7 @@ Usage:
   python keysnip.py --now            open the overlay immediately
   python keysnip.py --apply-config   sync the OS autostart entry with keysnip.json
   python keysnip.py --status         show config path, autostart state and whether the listener is running
+  python keysnip.py --stop           stop the running listener
 
 Overlay keys (defaults; all configurable under "keys" in keysnip.json):
   1-9               zoom into that cell of a 3x3 grid (numpad layout)
@@ -21,6 +22,7 @@ Overlay keys (defaults; all configurable under "keys" in keysnip.json):
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -492,13 +494,20 @@ def listen(window=1.5):
 _LOCK_HANDLE = None  # kept open for the life of the process to hold the single-instance lock
 
 
+def _lock_path():
+    import getpass
+    return Path(tempfile.gettempdir()) / f"keysnip-{getpass.getuser()}.lock"
+
+
+def _pid_path():
+    return _lock_path().with_suffix(".pid")
+
+
 def acquire_single_instance():
     """Take an OS-level exclusive lock; returns False if another keysnip listener already holds it.
     The OS releases the lock if the process exits or crashes, so it can't go stale."""
     global _LOCK_HANDLE
-    import getpass
-    path = Path(tempfile.gettempdir()) / f"keysnip-{getpass.getuser()}.lock"
-    handle = open(path, "a+b")
+    handle = open(_lock_path(), "a+b")
     try:
         if SYSTEM == "Windows":
             import msvcrt
@@ -537,13 +546,50 @@ def spawn_background():
         subprocess.Popen(args, start_new_session=True, **quiet)
 
 
+def listener_pid():
+    try:
+        return int(_pid_path().read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def stop_listener():
+    """Stop the running listener (found via its PID file, and only if the single-instance lock is held)."""
+    if not already_running():
+        _pid_path().unlink(missing_ok=True)
+        print("keysnip is not running.")
+        return 0
+    pid = listener_pid()
+    if pid is None:
+        print("keysnip is running but its PID file is missing; stop the process manually.")
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+    except OSError as exc:
+        print(f"could not stop keysnip (PID {pid}): {exc}")
+        return 1
+    deadline = time.time() + 5
+    while time.time() < deadline and already_running():
+        time.sleep(0.1)
+    if already_running():
+        print(f"sent stop to PID {pid} but keysnip is still running.")
+        return 1
+    _pid_path().unlink(missing_ok=True)
+    print(f"keysnip stopped (PID {pid}).")
+    return 0
+
+
 def main():
     if "--apply-config" in sys.argv:
         print(settings.apply(CONFIG))
         return 0
+    if "--stop" in sys.argv:
+        return stop_listener()
     if "--status" in sys.argv:
+        running = already_running()
         print(f"config: {settings.CONFIG_PATH}\nautostart configured: {CONFIG['autostart']}, "
-              f"registered with OS: {settings.is_enabled()}\nlistener running: {already_running()}")
+              f"registered with OS: {settings.is_enabled()}\nlistener running: {running}"
+              + (f" (PID {listener_pid()})" if running and listener_pid() else ""))
         return 0
     enable_dpi_awareness()
     if "--now" in sys.argv:
@@ -561,6 +607,7 @@ def main():
     if not acquire_single_instance():
         print("keysnip is already running; exiting.")
         return 2
+    _pid_path().write_text(str(os.getpid()))
     print(settings.apply(CONFIG))
     return listen(window=float(CONFIG["hotkey_window_seconds"]))
 

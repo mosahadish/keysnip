@@ -81,14 +81,15 @@ One file, the same command on every platform:
     python keysnip.py              # start the listener in the background and return (no console stays open)
     python keysnip.py --foreground # run the listener in this terminal instead (Ctrl+C quits, errors are visible)
     python keysnip.py --now        # open the overlay immediately, capture once, exit
-    python keysnip.py --status     # config path, autostart state, whether the listener is running
+    python keysnip.py --status     # config path, autostart state, whether the listener is running (and its PID)
+    python keysnip.py --stop       # stop the running listener
 
 The first form starts a detached copy of itself (`pythonw.exe` on Windows, a new session on macOS/Linux) and exits, so there is no terminal to keep open and it keeps running if you close the one you started it from. On Windows, `pythonw keysnip.py` avoids even the brief console flash of `python`. Launching it twice is harmless: a second copy sees the first and exits.
 
 With the listener running, press the configured hotkey (default **Win+G, then S**; Cmd+G, then S on macOS) within 1.5 s to open the overlay.
 
 - On Windows, with the default hotkey, Win+G (Game Bar) and Win+S (Search) are swallowed while the listener runs.
-- **Stopping it:** Windows `Get-CimInstance Win32_Process | Where-Object CommandLine -match keysnip` to find the PID, then `Stop-Process -Id <PID>`; macOS/Linux `pkill -f keysnip.py`.
+- **Stopping it:** `python keysnip.py --stop`. The listener records its PID in a file next to the lock in the temp folder, and `--stop` only acts when the single-instance lock is actually held. A listener started by an older version has no PID file; stop that one manually (Windows: `Get-CimInstance Win32_Process | Where-Object CommandLine -match keysnip`, then `Stop-Process -Id <PID>`; macOS/Linux: `pkill -f keysnip.py`). To restart after a config change: `--stop`, then `python keysnip.py`.
 
 ## Overlay keys
 
@@ -124,8 +125,7 @@ A right-click also cancels. The label above the selection shows its size and pos
 ## Platform notes
 
 - **Windows:** the overlay takes the foreground with `SetForegroundWindow` (attaching to the current foreground thread's input to get past the foreground lock) and takes it back if something steals it. It never synthesizes Alt key presses, because those put a window into menu mode and swallow keys. It waits for Win/Shift/Ctrl/Alt to be released before appearing, so a still-held modifier can't turn its keys into system shortcuts. Pressing the hotkey while the overlay is open is ignored. The listener detects when the session is unlocked and recreates its keyboard hook, so the hotkey keeps working after the lock screen. It also recreates the hook if it ever stops.
-- **Single instance:** only one listener runs at a time (an OS file lock in the temp folder). A second `python keysnip.py` prints "keysnip is already running" and exits with code 2, which also makes autostart harmless if you start it manually too. The lock is released automatically if the process exits or crashes. `--now`, `--status` and `--apply-config` are not affected.
-- **macOS:** grant the terminal Screen Recording (for capture) and Accessibility/Input Monitoring (for the hotkey).
+- **Single instance:** only one listener runs at a time (an OS file lock in the temp folder). A second `python keysnip.py` prints "keysnip is already running" and exits with code 2, which also makes autostart harmless if you start it manually too. The lock is released automatically if the process exits or crashes. `--now`, `--status`, `--stop` and `--apply-config` are not affected.- **macOS:** grant the terminal Screen Recording (for capture) and Accessibility/Input Monitoring (for the hotkey).
 - **Linux:** needs an X11 or XWayland session (`DISPLAY` set). Pure Wayland is not supported. The clipboard step needs `xclip` or `wl-copy`.
 
 ## Limitations
@@ -138,7 +138,7 @@ A right-click also cancels. The label above the selection shows its size and pos
 
 - **Overlay doesn't accept keys:** click it once to take focus, or restart the listener.
 - **Nothing happens on the hotkey:** check the listener is running, and that the keys are pressed in order within `hotkey_window_seconds` while holding the modifiers. After a lock/unlock the hook restarts itself within about a second.
-- **"keysnip is already running":** another listener holds the lock. Stop it first (see Usage), or just use it. `python keysnip.py --status` confirms it is running.
+- **"keysnip is already running":** another listener holds the lock. Stop it with `python keysnip.py --stop`, or just use it. `python keysnip.py --status` confirms it is running.
 - **Config change has no effect:** restart the listener; settings are read at startup. Warnings about invalid entries are printed to stderr, which the background copy discards; run `python keysnip.py --foreground` in a terminal to see them.
 - **Listener starts and nothing happens, no error:** the background copy hides startup errors. Run `python keysnip.py --foreground` to see them.
 - **Clipboard unavailable message:** the PNG is saved instead so the capture isn't lost; install `xclip` or `wl-copy` on Linux.
